@@ -3232,6 +3232,401 @@ func TestSimpleSend(t *testing.T) {
 	})
 }
 
+// sendQueueOverhead is the memory that the send queue counts for a segment of
+// data, beyond the bytes of the data.
+const sendQueueOverhead = tcp.SegOverheadSize - header.IPv4MaximumHeaderSize
+
+// newSendQueueContext returns a context with a connected endpoint, whose peer
+// advertises rcvWnd and whose send buffer size is sndBufSz. Its clock is
+// manual, so no timer sends a probe or a retransmission. The state after each
+// segment that the endpoint processes goes to the channel.
+func newSendQueueContext(t *testing.T, rcvWnd seqnum.Size, sndBufSz int) (*context.Context, chan tcp.TCPEndpointState) {
+	t.Helper()
+	states := make(chan tcp.TCPEndpointState, 64)
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		MTU:      e2e.DefaultMTU,
+		Clock:    faketime.NewManualClock(),
+		Probe: func(state *tcp.TCPEndpointState) {
+			select {
+			case states <- *state:
+			default:
+			}
+		},
+	})
+	c.CreateConnected(context.TestInitialSequenceNumber, rcvWnd, -1 /* epRcvBuf */)
+	c.EP.SocketOptions().SetSendBufferSize(int64(sndBufSz), true /* notify */)
+	if got := c.EP.SocketOptions().GetSendBufferSize(); got != int64(sndBufSz) {
+		t.Fatalf("send buffer size = %d, want %d", got, sndBufSz)
+	}
+	for len(states) > 0 {
+		<-states
+	}
+	return c, states
+}
+
+// sendQueueACK sends the endpoint of c an ACK of the first acked bytes of its
+// data, with the window wnd.
+func sendQueueACK(c *context.Context, acked int, wnd seqnum.Size) {
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: c.Port,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  seqnum.Value(context.TestInitialSequenceNumber).Add(1),
+		AckNum:  c.IRS.Add(1 + seqnum.Size(acked)),
+		RcvWnd:  wnd,
+	})
+}
+
+// nextSendQueueState returns the state after the next segment that the
+// endpoint processes.
+func nextSendQueueState(t *testing.T, states chan tcp.TCPEndpointState) tcp.TCPEndpointState {
+	t.Helper()
+	select {
+	case state := <-states:
+		return state
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the segment to be processed")
+	}
+	panic("unreachable")
+}
+
+// writeUntilBlocked writes size bytes at a time to the endpoint of c until
+// the write fails with ErrWouldBlock, which must happen before the writes
+// pass twice the send buffer size. It returns the number of writes that
+// succeeded and the bytes that they wrote.
+func writeUntilBlocked(t *testing.T, c *context.Context, size int) (writes, written int) {
+	t.Helper()
+	for written <= 2*int(c.EP.SocketOptions().GetSendBufferSize()) {
+		n, err := c.EP.Write(bytes.NewReader(make([]byte, size)), tcpip.WriteOptions{})
+		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
+			return writes, written
+		}
+		if err != nil {
+			t.Fatalf("Write failed: %s", err)
+		}
+		writes++
+		written += int(n)
+	}
+	t.Fatalf("writes of %d bytes did not block after %d bytes", size, written)
+	return writes, written
+}
+
+// TestSendQueueSmallWrites checks that the send queue counts the memory of its
+// segments, so that writes of a few bytes stop when their memory, not their
+// payload, reaches the send buffer size.
+func TestSendQueueSmallWrites(t *testing.T) {
+	const (
+		sndBufSz = 65536
+		size     = 3
+	)
+	c, states := newSendQueueContext(t, 0 /* rcvWnd */, sndBufSz)
+	defer c.Cleanup()
+
+	writes, written := writeUntilBlocked(t, c, size)
+	if c.EP.Readiness(waiter.WritableEvents) != 0 {
+		t.Error("endpoint is writable after ErrWouldBlock")
+	}
+
+	// The ACK leaves the window closed, so nothing is sent.
+	sendQueueACK(c, 0, 0)
+	state := nextSendQueueState(t, states)
+	if got, want := state.SndBufState.SndBufUsed, written; got != want {
+		t.Errorf("send buffer used = %d, want %d", got, want)
+	}
+	mem := state.SndBufState.SndMemUsed
+	if want := writes * (sendQueueOverhead + size); mem != want {
+		t.Errorf("send memory used = %d, want %d for %d writes", mem, want, writes)
+	}
+	if mem < sndBufSz || mem >= sndBufSz+sendQueueOverhead+size {
+		t.Errorf("send memory used = %d, want at least %d and less than one more segment", mem, sndBufSz)
+	}
+}
+
+// TestSendQueueBulkWrites checks that large writes still queue close to the
+// send buffer size in payload.
+func TestSendQueueBulkWrites(t *testing.T) {
+	const sndBufSz = 65536
+	for _, size := range []int{2 * sndBufSz, 1<<14 + 1} {
+		t.Run(fmt.Sprintf("%d", size), func(t *testing.T) {
+			c, states := newSendQueueContext(t, 0 /* rcvWnd */, sndBufSz)
+			defer c.Cleanup()
+
+			_, written := writeUntilBlocked(t, c, size)
+			if written*100 < sndBufSz*95 {
+				t.Errorf("writes queued %d bytes, want at least 95%% of %d", written, sndBufSz)
+			}
+
+			sendQueueACK(c, 0, 0)
+			state := nextSendQueueState(t, states)
+			if mem := state.SndBufState.SndMemUsed; mem < sndBufSz || mem > sndBufSz+sendQueueOverhead {
+				t.Errorf("send memory used = %d, want at least %d and at most %d more", mem, sndBufSz, sendQueueOverhead)
+			}
+		})
+	}
+}
+
+// TestSendQueueWindowOpens checks that the endpoint wakes its writers when
+// the segments of small writes merge as the window opens, and that the count
+// returns to 0 when the peer acknowledges all data.
+func TestSendQueueWindowOpens(t *testing.T) {
+	const sndBufSz = 65536
+	c, states := newSendQueueContext(t, 0 /* rcvWnd */, sndBufSz)
+	defer c.Cleanup()
+
+	_, written := writeUntilBlocked(t, c, 3)
+	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
+	// The window opens, and the endpoint sends all data in a few segments.
+	sendQueueACK(c, 0, 30000)
+	state := nextSendQueueState(t, states)
+	segments, sent := 0, 0
+	for b := c.GetPacketNonBlocking(); b != nil; b = c.GetPacketNonBlocking() {
+		segments++
+		sent += len(header.TCP(header.IPv4(b.AsSlice()).Payload()).Payload())
+		b.Release()
+	}
+	if sent != written {
+		t.Fatalf("sent %d bytes, want %d", sent, written)
+	}
+	if got, want := state.SndBufState.SndMemUsed, segments*sendQueueOverhead+written; got != want {
+		t.Errorf("send memory used = %d, want %d for %d segments", got, want, segments)
+	}
+	if segments*sendQueueOverhead+written >= sndBufSz/2 {
+		t.Fatalf("%d segments sent, too many to free half of the send buffer", segments)
+	}
+	select {
+	case <-ch:
+	default:
+		t.Error("no writable notification after the merge freed the send buffer")
+	}
+
+	sendQueueACK(c, written, 30000)
+	state = nextSendQueueState(t, states)
+	if got := state.SndBufState.SndMemUsed; got != 0 {
+		t.Errorf("send memory used after the ACK = %d, want 0", got)
+	}
+	if got := state.SndBufState.SndBufUsed; got != 0 {
+		t.Errorf("send buffer used after the ACK = %d, want 0", got)
+	}
+}
+
+// TestSendQueueACKWakesWriters checks that an ACK wakes the writers when the
+// memory of the send queue falls below half the send buffer size, even though
+// its payload was never above half.
+func TestSendQueueACKWakesWriters(t *testing.T) {
+	const (
+		sndBufSz = 32768
+		// The window takes one segment at a time, so none merge.
+		size = 300
+	)
+	c, states := newSendQueueContext(t, 0 /* rcvWnd */, sndBufSz)
+	defer c.Cleanup()
+
+	writes, written := writeUntilBlocked(t, c, size)
+	if written >= sndBufSz/2 {
+		t.Fatalf("writes queued %d bytes, want less than half of %d", written, sndBufSz)
+	}
+	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
+	for acked := 0; acked <= written; acked += size {
+		sendQueueACK(c, acked, size)
+		state := nextSendQueueState(t, states)
+		mem := state.SndBufState.SndMemUsed
+		select {
+		case <-ch:
+			if mem >= sndBufSz/2 {
+				t.Errorf("writable notification with %d bytes of memory used, want less than %d", mem, sndBufSz/2)
+			}
+			return
+		default:
+			if mem < sndBufSz/2 {
+				t.Fatalf("no writable notification with %d bytes of memory used", mem)
+			}
+		}
+		b := c.GetPacket()
+		checker.IPv4(t, b, checker.PayloadLen(header.TCPMinimumSize+size))
+		b.Release()
+	}
+	t.Fatalf("no writable notification after %d writes were acknowledged", writes)
+}
+
+// TestSendQueueSplit checks the count while the endpoint splits a segment to
+// fit the window, and that it returns to 0 when the peer acknowledges all
+// data.
+func TestSendQueueSplit(t *testing.T) {
+	const (
+		sndBufSz = 65536
+		// Less than the MSS, so that the window splits the segment.
+		wnd  = 500
+		size = 4 * wnd
+	)
+	c, states := newSendQueueContext(t, wnd, sndBufSz)
+	defer c.Cleanup()
+
+	if _, err := c.EP.Write(bytes.NewReader(make([]byte, size)), tcpip.WriteOptions{}); err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+	for acked := wnd; acked <= size; acked += wnd {
+		b := c.GetPacket()
+		checker.IPv4(t, b, checker.PayloadLen(header.TCPMinimumSize+wnd))
+		b.Release()
+
+		sendQueueACK(c, acked, wnd)
+		state := nextSendQueueState(t, states)
+		// The segment sent and the rest, if any, each count their own
+		// bytes plus the overhead of one segment.
+		left := size - acked
+		want := 0
+		switch {
+		case left > wnd:
+			want = 2*sendQueueOverhead + left
+		case left > 0:
+			want = sendQueueOverhead + left
+		}
+		if got := state.SndBufState.SndMemUsed; got != want {
+			t.Errorf("send memory used with %d bytes acknowledged = %d, want %d", acked, got, want)
+		}
+		if got := state.SndBufState.SndBufUsed; got != left {
+			t.Errorf("send buffer used with %d bytes acknowledged = %d, want %d", acked, got, left)
+		}
+	}
+}
+
+// TestSendQueuePartialACKWakesWriters checks that a partial ACK of a segment
+// takes the bytes it acknowledges off the count, so that a blocked writer
+// wakes once the memory of the send queue falls below half the send buffer
+// size, even if a retransmission then splits the rest of the segment.
+func TestSendQueuePartialACKWakesWriters(t *testing.T) {
+	const (
+		sndBufSz = 65536
+		mss      = 3000
+		wnd      = 65535
+	)
+	clock := faketime.NewManualClock()
+	states := make(chan tcp.TCPEndpointState, 64)
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		MTU:      e2e.DefaultMTU,
+		Clock:    clock,
+		Probe: func(state *tcp.TCPEndpointState) {
+			select {
+			case states <- *state:
+			default:
+			}
+		},
+	})
+	defer c.Cleanup()
+	c.SetGSOEnabled(true)
+	c.CreateConnectedWithRawOptions(context.TestInitialSequenceNumber, wnd, -1 /* epRcvBuf */, []byte{
+		header.TCPOptionMSS, 4, byte(mss / 256), byte(mss % 256),
+	})
+	c.EP.SocketOptions().SetSendBufferSize(sndBufSz, true /* notify */)
+	for len(states) > 0 {
+		<-states
+	}
+
+	_, written := writeUntilBlocked(t, c, sndBufSz)
+	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+	woken := false
+	sent := func() []int {
+		var lens []int
+		for b := c.GetPacketNonBlocking(); b != nil; b = c.GetPacketNonBlocking() {
+			lens = append(lens, len(header.TCP(header.IPv4(b.AsSlice()).Payload()).Payload()))
+			b.Release()
+		}
+		return lens
+	}
+	check := func(what string) int {
+		state := nextSendQueueState(t, states)
+		select {
+		case <-ch:
+			woken = true
+		default:
+		}
+		t.Logf("%s: %d bytes of payload, %d bytes of memory, woken %t", what, state.SndBufState.SndBufUsed, state.SndBufState.SndMemUsed, woken)
+		return state.SndBufState.SndMemUsed
+	}
+
+	// The peer acknowledges the first flight, so that the endpoint sends a
+	// GSO segment of several MSS.
+	acked := 0
+	for _, n := range sent() {
+		acked += n
+	}
+	sendQueueACK(c, acked, wnd)
+	check("ACK of the first flight")
+	flight := sent()
+	if len(flight) == 0 || flight[0] < 4*mss {
+		t.Fatalf("second flight = %v, want a first segment of at least %d bytes", flight, 4*mss)
+	}
+
+	// The peer acknowledges half of that segment.
+	acked += flight[0] / 2
+	sendQueueACK(c, acked, wnd)
+	check("partial ACK")
+
+	// The retransmission timer resends the rest of the segment, split to one
+	// MSS.
+	retransmitted := false
+	for i := 0; i < 40 && !retransmitted; i++ {
+		clock.Advance(250 * time.Millisecond)
+		if b := c.GetPacketWithTimeout(100 * time.Millisecond); b != nil {
+			retransmitted = true
+			b.Release()
+		}
+	}
+	if !retransmitted {
+		t.Fatal("no retransmission")
+	}
+
+	sendQueueACK(c, written, wnd)
+	if mem := check("ACK of all data"); mem != 0 {
+		t.Errorf("send memory used after the ACK of all data = %d, want 0", mem)
+	}
+	if !woken {
+		t.Error("the writer blocked by a full send buffer was never woken")
+	}
+}
+
+// TestSendQueueBufferGrows checks that a larger send buffer wakes the writers
+// only when its free room is at least half the memory that the send queue
+// uses.
+func TestSendQueueBufferGrows(t *testing.T) {
+	const sndBufSz = 65536
+	c, states := newSendQueueContext(t, 0 /* rcvWnd */, sndBufSz)
+	defer c.Cleanup()
+
+	writeUntilBlocked(t, c, 3)
+	sendQueueACK(c, 0, 0)
+	used := nextSendQueueState(t, states).SndBufState.SndMemUsed
+	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
+	// The smallest send buffer whose free room is half the memory used.
+	boundary := used + used>>1
+	c.EP.SocketOptions().SetSendBufferSize(int64(boundary-1), true /* notify */)
+	select {
+	case <-ch:
+		t.Errorf("writable notification with %d bytes free, less than half of the %d bytes of memory used", boundary-1-used, used)
+	default:
+	}
+
+	c.EP.SocketOptions().SetSendBufferSize(int64(boundary+1), true /* notify */)
+	select {
+	case <-ch:
+	default:
+		t.Errorf("no writable notification with %d bytes free, at least half of the %d bytes of memory used", boundary+1-used, used)
+	}
+}
+
 func TestZeroWindowSend(t *testing.T) {
 	clock := faketime.NewManualClock()
 	c := context.NewWithOpts(t, context.Options{EnableV4: true, MTU: e2e.DefaultMTU, Clock: clock})

@@ -402,6 +402,10 @@ type TCPSndBufState struct {
 	// SndBufUsed is the number of bytes held in the socket send buffer.
 	SndBufUsed int
 
+	// SndMemUsed is the memory in use by the segments in the socket send
+	// buffer, including their overhead.
+	SndMemUsed int
+
 	// SndClosed indicates that the endpoint has been closed for sends.
 	SndClosed bool
 

@@ -82,10 +82,13 @@ type segment struct {
 	// acked indicates if the segment has already been SACKed.
 	acked bool
 
-	// dataMemSize is the memory used by pkt initially. The value is used for
-	// memory accounting in the receive buffer instead of pkt.MemSize() because
-	// packet contents can be modified, so relying on the computed memory size
-	// to "free" reserved bytes could leak memory in the receiver.
+	// dataMemSize is the memory used by pkt when it was last measured. The
+	// value is used for memory accounting in the receive and send buffers
+	// instead of pkt.MemSize() because packet contents can be modified, so
+	// relying on the computed memory size to "free" reserved bytes could leak
+	// memory. merge moves data between two segments and measures both, which
+	// keeps the sum. updateDataMemSize measures pkt again and moves the
+	// owner's count with it.
 	dataMemSize int
 
 	// lost indicates if the segment is marked as lost by RACK.
@@ -165,6 +168,10 @@ func (s *segment) clone() *segment {
 	t.qFlags = s.qFlags
 	t.dataMemSize = s.dataMemSize
 	t.pkt = s.pkt.Clone()
+	if t.ep != nil {
+		// DecRef releases the memory of t on its own, so count it.
+		t.updateOwnerMemUsed(t.segMemSize())
+	}
 	return t
 }
 
@@ -182,33 +189,42 @@ func (s *segment) merge(oth *segment) {
 	oth.dataMemSize = oth.pkt.MemSize()
 }
 
+// updateDataMemSize measures the memory that pkt uses now, and moves the
+// owner's count by the change.
+func (s *segment) updateDataMemSize() {
+	delta := s.pkt.MemSize() - s.dataMemSize
+	s.dataMemSize += delta
+	if s.ep != nil {
+		s.updateOwnerMemUsed(delta)
+	}
+}
+
 // setOwner sets the owning endpoint for this segment. Its required
 // to be called to ensure memory accounting for receive/send buffer
 // queues is done properly.
 func (s *segment) setOwner(ep *Endpoint, qFlags queueFlags) {
-	switch qFlags {
-	case recvQ:
-		ep.updateReceiveMemUsed(s.segMemSize())
-	case sendQ:
-		// no memory account for sendQ yet.
-	default:
-		panic(fmt.Sprintf("unexpected queue flag %b", qFlags))
-	}
 	s.ep = ep
 	s.qFlags = qFlags
+	s.updateOwnerMemUsed(s.segMemSize())
+}
+
+// updateOwnerMemUsed adds delta to the memory count of the owner's queue
+// that holds s.
+func (s *segment) updateOwnerMemUsed(delta int) {
+	switch s.qFlags {
+	case recvQ:
+		s.ep.updateReceiveMemUsed(delta)
+	case sendQ:
+		s.ep.updateSendMemUsed(delta)
+	default:
+		panic(fmt.Sprintf("unexpected queue flag %b set for segment", s.qFlags))
+	}
 }
 
 func (s *segment) DecRef() {
 	s.segmentRefs.DecRef(func() {
 		if s.ep != nil {
-			switch s.qFlags {
-			case recvQ:
-				s.ep.updateReceiveMemUsed(-s.segMemSize())
-			case sendQ:
-				// no memory accounting for sendQ yet.
-			default:
-				panic(fmt.Sprintf("unexpected queue flag %b set for segment", s.qFlags))
-			}
+			s.updateOwnerMemUsed(-s.segMemSize())
 		}
 		s.pkt.DecRef()
 		s.pkt = nil
