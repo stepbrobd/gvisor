@@ -71,6 +71,41 @@ func (r *receiver) acceptable(segSeq seqnum.Value, segLen seqnum.Size) bool {
 	return header.Acceptable(segSeq, segLen, r.RcvNxt, r.RcvNxt.Add(r.rcvWnd))
 }
 
+// acceptsZeroWindowACK returns true if the sender must process the ACK of s,
+// a segment that the receiver does not accept.
+//
+// RFC 9293 section 3.10.7.4: "If the RCV.WND is zero, no segments will be
+// acceptable, but special allowance should be made to accept valid ACKs,
+// URGs, and RSTs." handleReset accepts an RST at RCV.NXT, and URG is not
+// supported.
+//
+// s must start in RCV.NXT =< SEG.SEQ =< RcvAcc. RcvAcc is the right edge last
+// advertised, and because the window does not shrink, also the highest. An
+// open window accepts every segment that starts in this range, so s passes
+// only while the window is zero. Then RcvAcc is RCV.NXT, and SEG.SEQ must be
+// RCV.NXT, as for the empty segment that a zero window accepts. The ACK must
+// be in SND.UNA =< SEG.ACK =< SND.NXT, which is inside the range of RFC 5961
+// section 5. Thus a blind attacker must guess the same SEG.SEQ and SEG.ACK as
+// for an acceptable segment. An ACK below SND.UNA is a duplicate, which RFC
+// 9293 lets the receiver ignore. The receive side must be open, because the
+// peer sends nothing past its FIN.
+//
+// If the peer sends only inside the windows advertised, each earlier segment
+// that updated the send window started at or before RcvAcc and acknowledged
+// at most SND.UNA. Then the SND.WL1 and SND.WL2 check of RFC 9293 lets s
+// update the send window. A peer that sends past the window can break this,
+// as it can for an acceptable segment.
+//
+// +checklocks:r.ep.mu
+func (r *receiver) acceptsZeroWindowACK(s *segment) bool {
+	return !r.closed &&
+		!r.acceptable(s.sequenceNumber, seqnum.Size(s.payloadSize())) &&
+		r.RcvNxt.LessThanEq(s.sequenceNumber) &&
+		s.sequenceNumber.LessThanEq(r.RcvAcc) &&
+		r.ep.snd.SndUna.LessThanEq(s.ackNumber) &&
+		s.ackNumber.LessThanEq(r.ep.snd.SndNxt)
+}
+
 // currentWindow returns the available space in the window that was advertised
 // last to our peer.
 func (r *receiver) currentWindow() (curWnd seqnum.Size) {
@@ -276,8 +311,17 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 	}
 
 	// Handle ACK (not FIN-ACK, which we handled above) during one of the
-	// shutdown states. These completions require that our FIN was sent;
-	// without finSent a data ACK would be mistaken for a FIN ACK.
+	// shutdown states.
+	r.handleFINAcked(s)
+
+	return true
+}
+
+// handleFINAcked moves the endpoint to its next state if s acknowledges our
+// FIN in one of the shutdown states. The move requires that our FIN was sent;
+// without finSent a data ACK would be mistaken for a FIN ACK.
+// +checklocks:r.ep.mu
+func (r *receiver) handleFINAcked(s *segment) {
 	if s.flags.Contains(header.TCPFlagAck) && r.ep.snd.finSent && s.ackNumber == r.ep.snd.SndNxt {
 		switch r.ep.EndpointState() {
 		case StateFinWait1:
@@ -290,8 +334,6 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 			r.ep.transitionToStateCloseLocked()
 		}
 	}
-
-	return true
 }
 
 // updateRTT estimates a receiver-side RTT for receive-buffer autotuning, based
