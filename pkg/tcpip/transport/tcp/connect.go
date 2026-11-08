@@ -1379,12 +1379,18 @@ func (e *Endpoint) handleSegmentLocked(s *segment) (cont bool, err tcpip.Error) 
 		// RFC 793, page 41 states that "once in the ESTABLISHED
 		// state all segments must carry current acknowledgment
 		// information."
+		zeroWindowACK := e.rcv.acceptsZeroWindowACK(s)
 		drop, err := e.rcv.handleRcvdSegment(s)
 		if err != nil {
 			return false, err
 		}
 		if drop {
-			return true, nil
+			if !zeroWindowACK {
+				return true, nil
+			}
+			// The receiver drops the data of s but takes its ACK.
+			e.rcv.lastRcvdAckTime = s.rcvdTime
+			e.rcv.handleFINAcked(s)
 		}
 
 		// Now check if the received segment has caused us to transition

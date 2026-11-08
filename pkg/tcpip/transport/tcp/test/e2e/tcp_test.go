@@ -2765,6 +2765,445 @@ func TestFullWindowReceive(t *testing.T) {
 	)
 }
 
+// zeroWindowSegmentSize is the largest segment that fillReceiveWindow sends.
+const zeroWindowSegmentSize = 50000
+
+// fillReceiveWindow sends data to the endpoint of c, which does not read it.
+// The first segment has first bytes. If untilZero is true, more segments
+// follow, each up to the window advertised, until the window is zero. It
+// returns RCV.NXT and the window advertised, from the last ACK.
+func fillReceiveWindow(t *testing.T, c *context.Context, ws uint8, first int, untilZero bool) (seqnum.Value, seqnum.Size) {
+	t.Helper()
+	rcvNxt := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	n := first
+	for {
+		c.SendPacket(make([]byte, n), &context.Headers{
+			SrcPort: context.TestPort,
+			DstPort: c.Port,
+			Flags:   header.TCPFlagAck,
+			SeqNum:  rcvNxt,
+			AckNum:  c.IRS.Add(1),
+			RcvWnd:  30000,
+		})
+		b := c.GetPacket()
+		tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
+		ack := seqnum.Value(tcpHdr.AckNumber())
+		wnd := seqnum.Size(tcpHdr.WindowSize()) << ws
+		b.Release()
+		if want := rcvNxt.Add(seqnum.Size(n)); ack != want {
+			t.Fatalf("ACK after %d bytes = %d, want %d", n, ack, want)
+		}
+		rcvNxt = ack
+		if !untilZero || wnd == 0 {
+			return rcvNxt, wnd
+		}
+		n = min(zeroWindowSegmentSize, int(wnd))
+	}
+}
+
+// TestZeroWindowValidACK checks that an endpoint with a zero receive window
+// processes the valid ACK of a segment that it does not accept, if the
+// segment starts inside the window advertised, and no other ACK of a segment
+// that it does not accept.
+func TestZeroWindowValidACK(t *testing.T) {
+	const (
+		// The window is rcvBufSz. Filling it leaves receive buffer space,
+		// so a segment with data still reaches the receiver.
+		rcvBufSz = 30000
+		// A window scale of 5, as in TestZeroScaledWindowReceive.
+		scaledBufSz = 65535 * 10
+		scaledWS    = 5
+		peerWnd     = 30000
+		sent        = 10
+	)
+	data := []byte{1, 2, 3, 4}
+	nxtAck := func(_, nxt seqnum.Value) seqnum.Value { return nxt }
+	atRcvNxt := func(rcvNxt, _ seqnum.Value) seqnum.Value { return rcvNxt }
+	pastEdge := func(n seqnum.Size) func(_, edge seqnum.Value) seqnum.Value {
+		return func(_, edge seqnum.Value) seqnum.Value { return edge.Add(n) }
+	}
+
+	for _, test := range []struct {
+		name string
+		// scaled uses a window scale of 5.
+		scaled bool
+		// open fills half of the window, so the window stays open.
+		open bool
+		// seq returns SEG.SEQ from RCV.NXT and the right edge advertised.
+		seq     func(rcvNxt, edge seqnum.Value) seqnum.Value
+		payload []byte
+		// ack returns SEG.ACK from SND.UNA and SND.NXT.
+		ack       func(una, nxt seqnum.Value) seqnum.Value
+		processed bool
+	}{
+		{
+			name:      "data at RCV.NXT",
+			seq:       atRcvNxt,
+			payload:   data,
+			ack:       nxtAck,
+			processed: true,
+		},
+		{
+			name:      "scaled window: data at RCV.NXT",
+			scaled:    true,
+			seq:       atRcvNxt,
+			payload:   data,
+			ack:       nxtAck,
+			processed: true,
+		},
+		{
+			name:    "ack past SND.NXT",
+			seq:     atRcvNxt,
+			payload: data,
+			ack:     func(_, nxt seqnum.Value) seqnum.Value { return nxt.Add(1) },
+		},
+		{
+			name:    "ack below SND.UNA",
+			seq:     atRcvNxt,
+			payload: data,
+			ack:     func(una, _ seqnum.Value) seqnum.Value { return una - 1 },
+		},
+		{
+			// MAX.SND.WND is peerWnd, the only window the peer advertises.
+			name:    "ack below SND.UNA - MAX.SND.WND",
+			seq:     atRcvNxt,
+			payload: data,
+			ack:     func(una, _ seqnum.Value) seqnum.Value { return una - peerWnd - 1 },
+		},
+		{
+			name: "segment before RCV.NXT",
+			seq:  func(rcvNxt, _ seqnum.Value) seqnum.Value { return rcvNxt - 1 },
+			ack:  nxtAck,
+		},
+		{
+			name: "segment just past the right edge",
+			seq:  pastEdge(1),
+			ack:  nxtAck,
+		},
+		{
+			// A peer that sent 4 bytes that the receiver did not accept.
+			name: "segment 4 bytes past the right edge",
+			seq:  pastEdge(4),
+			ack:  nxtAck,
+		},
+		{
+			name: "segment 2^30 bytes past the right edge",
+			seq:  pastEdge(1 << 30),
+			ack:  nxtAck,
+		},
+		{
+			name:   "scaled window: segment just past the right edge",
+			scaled: true,
+			seq:    pastEdge(1),
+			ack:    nxtAck,
+		},
+		{
+			name: "open window: segment just past the right edge",
+			open: true,
+			seq:  pastEdge(1),
+			ack:  nxtAck,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			states := make(chan tcp.TCPEndpointState, 16)
+			c := context.NewWithOpts(t, context.Options{
+				EnableV4: true,
+				MTU:      e2e.DefaultMTU,
+				Probe: func(state *tcp.TCPEndpointState) {
+					select {
+					case states <- *state:
+					default:
+					}
+				},
+			})
+			defer c.Cleanup()
+
+			// Fill the window and do not read.
+			var ws uint8
+			var rcvNxt seqnum.Value
+			var wnd seqnum.Size
+			if test.scaled {
+				ws = scaledWS
+				c.CreateConnectedWithRawOptions(context.TestInitialSequenceNumber, peerWnd, scaledBufSz, []byte{
+					header.TCPOptionWS, 3, 0, header.TCPOptionNOP,
+				})
+				rcvNxt, wnd = fillReceiveWindow(t, c, ws, zeroWindowSegmentSize, true)
+			} else {
+				c.CreateConnected(context.TestInitialSequenceNumber, peerWnd, rcvBufSz)
+				first := rcvBufSz
+				if test.open {
+					first = rcvBufSz / 2
+				}
+				rcvNxt, wnd = fillReceiveWindow(t, c, ws, first, !test.open)
+			}
+			if test.open != (wnd != 0) {
+				t.Fatalf("window after the fill = %d, want open %t", wnd, test.open)
+			}
+			edge := rcvNxt.Add(wnd)
+
+			// Send data that the peer does not acknowledge yet.
+			una := c.IRS.Add(1)
+			nxt := una.Add(sent)
+			if _, err := c.EP.Write(bytes.NewReader(make([]byte, sent)), tcpip.WriteOptions{}); err != nil {
+				t.Fatalf("Write failed: %s", err)
+			}
+			b := c.GetPacket()
+			defer b.Release()
+			checker.IPv4(t, b,
+				checker.PayloadLen(header.TCPMinimumSize+sent),
+				checker.TCP(
+					checker.DstPort(context.TestPort),
+					checker.TCPSeqNum(uint32(una)),
+					checker.TCPAckNum(uint32(rcvNxt)),
+					checker.TCPWindow(uint16(wnd>>ws)),
+				),
+			)
+
+			for len(states) > 0 {
+				<-states
+			}
+			// The receiver does not accept the segment and sends an ACK.
+			c.SendPacket(test.payload, &context.Headers{
+				SrcPort: context.TestPort,
+				DstPort: c.Port,
+				Flags:   header.TCPFlagAck,
+				SeqNum:  test.seq(rcvNxt, edge),
+				AckNum:  test.ack(una, nxt),
+				RcvWnd:  peerWnd / 2,
+			})
+			b = c.GetPacket()
+			defer b.Release()
+			checker.IPv4(t, b,
+				checker.PayloadLen(header.TCPMinimumSize),
+				checker.TCP(
+					checker.DstPort(context.TestPort),
+					checker.TCPSeqNum(uint32(nxt)),
+					checker.TCPAckNum(uint32(rcvNxt)),
+					checker.TCPWindow(uint16(wnd>>ws)),
+				),
+			)
+
+			wantUna, wantWnd, wantUsed := una, seqnum.Size(peerWnd), sent
+			if test.processed {
+				wantUna, wantWnd, wantUsed = nxt, peerWnd/2, 0
+			}
+			select {
+			case state := <-states:
+				if got := state.Sender.SndUna; got != wantUna {
+					t.Errorf("SND.UNA = %d, want %d", got, wantUna)
+				}
+				if got := state.Sender.SndWnd; got != wantWnd {
+					t.Errorf("SND.WND = %d, want %d", got, wantWnd)
+				}
+				if got := state.SndBufState.SndBufUsed; got != wantUsed {
+					t.Errorf("send buffer used = %d, want %d", got, wantUsed)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for the segment to be processed")
+			}
+		})
+	}
+}
+
+// TestZeroWindowACKOfFIN checks the ACK of the endpoint's FIN in a segment
+// that a zero window does not accept. In FIN-WAIT-1 the endpoint takes the ACK
+// and enters FIN-WAIT-2. In LAST-ACK the segment is past the peer's FIN, and
+// the endpoint does not take its ACK.
+func TestZeroWindowACKOfFIN(t *testing.T) {
+	const rcvBufSz = 30000
+	for _, test := range []struct {
+		name      string
+		peerFIN   bool
+		wantState tcp.EndpointState
+		processed bool
+	}{
+		{name: "FIN-WAIT-1", wantState: tcp.StateFinWait2, processed: true},
+		{name: "LAST-ACK", peerFIN: true, wantState: tcp.StateLastAck},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			states := make(chan tcp.TCPEndpointState, 16)
+			c := context.NewWithOpts(t, context.Options{
+				EnableV4: true,
+				MTU:      e2e.DefaultMTU,
+				Probe: func(state *tcp.TCPEndpointState) {
+					select {
+					case states <- *state:
+					default:
+					}
+				},
+			})
+			defer c.Cleanup()
+			c.CreateConnected(context.TestInitialSequenceNumber, 30000, rcvBufSz)
+			rcvNxt, _ := fillReceiveWindow(t, c, 0, rcvBufSz, true)
+
+			if test.peerFIN {
+				// An empty FIN at RCV.NXT is acceptable.
+				c.SendPacket(nil, &context.Headers{
+					SrcPort: context.TestPort,
+					DstPort: c.Port,
+					Flags:   header.TCPFlagAck | header.TCPFlagFin,
+					SeqNum:  rcvNxt,
+					AckNum:  c.IRS.Add(1),
+					RcvWnd:  30000,
+				})
+				rcvNxt++
+				b := c.GetPacket()
+				defer b.Release()
+				checker.IPv4(t, b, checker.TCP(
+					checker.DstPort(context.TestPort),
+					checker.TCPAckNum(uint32(rcvNxt)),
+					checker.TCPWindow(0),
+				))
+			}
+			if err := c.EP.Shutdown(tcpip.ShutdownWrite); err != nil {
+				t.Fatalf("Shutdown failed: %s", err)
+			}
+			b := c.GetPacket()
+			defer b.Release()
+			checker.IPv4(t, b, checker.TCP(
+				checker.DstPort(context.TestPort),
+				checker.TCPSeqNum(uint32(c.IRS)+1),
+				checker.TCPFlags(header.TCPFlagAck|header.TCPFlagFin),
+			))
+
+			for len(states) > 0 {
+				<-states
+			}
+			una := c.IRS.Add(1)
+			finAck := una.Add(1)
+			c.SendPacket([]byte{1, 2, 3, 4}, &context.Headers{
+				SrcPort: context.TestPort,
+				DstPort: c.Port,
+				Flags:   header.TCPFlagAck,
+				SeqNum:  rcvNxt,
+				AckNum:  finAck,
+				RcvWnd:  30000,
+			})
+			b = c.GetPacket()
+			defer b.Release()
+			checker.IPv4(t, b,
+				checker.PayloadLen(header.TCPMinimumSize),
+				checker.TCP(
+					checker.DstPort(context.TestPort),
+					checker.TCPSeqNum(uint32(finAck)),
+					checker.TCPAckNum(uint32(rcvNxt)),
+					checker.TCPWindow(0),
+				),
+			)
+
+			wantUna := una
+			if test.processed {
+				wantUna = finAck
+			}
+			select {
+			case state := <-states:
+				if got := state.Sender.SndUna; got != wantUna {
+					t.Errorf("SND.UNA = %d, want %d", got, wantUna)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for the segment to be processed")
+			}
+			if got := tcp.EndpointState(c.EP.State()); got != test.wantState {
+				t.Errorf("state = %s, want %s", got, test.wantState)
+			}
+		})
+	}
+}
+
+// TestZeroWindowACKUserTimeout checks that an ACK in a segment that a zero
+// window does not accept counts for the user timeout as a segment heard from
+// the peer.
+func TestZeroWindowACKUserTimeout(t *testing.T) {
+	const (
+		rcvBufSz      = 30000
+		keepaliveIdle = 10 * time.Second
+		userTimeout   = 25 * time.Second
+	)
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		MTU:      e2e.DefaultMTU,
+		Clock:    clock,
+	})
+	defer c.Cleanup()
+	c.CreateConnected(context.TestInitialSequenceNumber, 30000, rcvBufSz)
+
+	idle := tcpip.KeepaliveIdleOption(keepaliveIdle)
+	if err := c.EP.SetSockOpt(&idle); err != nil {
+		t.Fatalf("SetSockOpt(&%T(%s)): %s", idle, keepaliveIdle, err)
+	}
+	interval := tcpip.KeepaliveIntervalOption(keepaliveIdle)
+	if err := c.EP.SetSockOpt(&interval); err != nil {
+		t.Fatalf("SetSockOpt(&%T(%s)): %s", interval, keepaliveIdle, err)
+	}
+	if err := c.EP.SetSockOptInt(tcpip.KeepaliveCountOption, 10); err != nil {
+		t.Fatalf("SetSockOptInt(tcpip.KeepaliveCountOption, 10): %s", err)
+	}
+	uto := tcpip.TCPUserTimeoutOption(userTimeout)
+	if err := c.EP.SetSockOpt(&uto); err != nil {
+		t.Fatalf("SetSockOpt(&%T(%s)): %s", uto, userTimeout, err)
+	}
+	c.EP.SocketOptions().SetKeepAlive(true)
+
+	rcvNxt, _ := fillReceiveWindow(t, c, 0, rcvBufSz, true)
+	ep := c.EP.(*tcp.Endpoint)
+	// settle waits until the endpoint has rearmed its timers.
+	settle := func() {
+		ep.LockUser()
+		ep.UnlockUser()
+	}
+	settle()
+	keepalive := func() {
+		t.Helper()
+		clock.Advance(keepaliveIdle)
+		b := c.GetPacket()
+		defer b.Release()
+		checker.IPv4(t, b,
+			checker.PayloadLen(header.TCPMinimumSize),
+			checker.TCP(
+				checker.DstPort(context.TestPort),
+				checker.TCPSeqNum(uint32(c.IRS)),
+				checker.TCPAckNum(uint32(rcvNxt)),
+				checker.TCPFlags(header.TCPFlagAck),
+			),
+		)
+		settle()
+	}
+
+	// The peer does not answer the first keepalive with an acceptable
+	// segment, but with data that the zero window does not accept.
+	keepalive()
+	clock.Advance(2 * time.Second)
+	c.SendPacket([]byte{1, 2, 3, 4}, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: c.Port,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  rcvNxt,
+		AckNum:  c.IRS.Add(1),
+		RcvWnd:  30000,
+	})
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
+		checker.PayloadLen(header.TCPMinimumSize),
+		checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPAckNum(uint32(rcvNxt)),
+			checker.TCPWindow(0),
+		),
+	)
+	settle()
+
+	// The endpoint goes idle again and sends a keepalive that the peer does
+	// not answer. One interval later, the last ACK from the peer is 20s old,
+	// less than the user timeout, so the endpoint sends another keepalive.
+	keepalive()
+	keepalive()
+	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateEstablished; got != want {
+		t.Errorf("state = %s, want %s", got, want)
+	}
+}
+
 func TestSmallReceiveBufferReadiness(t *testing.T) {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
