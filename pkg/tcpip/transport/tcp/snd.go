@@ -749,6 +749,10 @@ func (s *sender) splitSeg(seg *segment, size int) {
 		seg.flags ^= header.TCPFlagPsh
 	}
 	seg.pkt.Data().CapLength(size)
+
+	// Each part now counts its own bytes, plus its own structs.
+	seg.updateDataMemSize()
+	nSeg.updateDataMemSize()
 }
 
 // NextSeg implements the RFC6675 NextSeg() operation.
@@ -889,6 +893,8 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 			// triggering bugs in poorly written DNS
 			// implementations.
 			var nextTooBig bool
+			memUsed := s.ep.sendMemUsed()
+			merged := false
 			for nSeg := seg.Next(); nSeg != nil && nSeg.payloadSize() != 0; nSeg = seg.Next() {
 				if seg.payloadSize()+nSeg.payloadSize() > available {
 					nextTooBig = true
@@ -897,6 +903,11 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 				seg.merge(nSeg)
 				s.writeList.Remove(nSeg)
 				nSeg.DecRef()
+				merged = true
+			}
+			if merged {
+				// Each merged segment frees its overhead.
+				s.ep.updateSndBufferUsage(0, memUsed)
 			}
 			if !nextTooBig {
 				nagle := s.Outstanding > 0 && s.ep.ops.GetDelayOption() &&
@@ -1709,6 +1720,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		}
 
 		// Remove all acknowledged data from the write list.
+		memUsed := s.ep.sendMemUsed()
 		acked := s.SndUna.Size(ack)
 		s.SndUna = ack
 		ackLeft := acked
@@ -1727,6 +1739,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			if datalen > ackLeft {
 				prevCount := s.pCount(seg, s.MaxPayloadSize)
 				seg.TrimFront(ackLeft)
+				seg.updateDataMemSize()
 				seg.sequenceNumber.UpdateForward(ackLeft)
 				s.Outstanding -= prevCount - s.pCount(seg, s.MaxPayloadSize)
 				break
@@ -1782,7 +1795,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		}
 
 		// Update the send buffer usage and notify potential waiters.
-		s.ep.updateSndBufferUsage(int(acked))
+		s.ep.updateSndBufferUsage(int(acked), memUsed)
 
 		// It is possible for s.outstanding to drop below zero if we get
 		// a retransmit timeout, reset outstanding to zero but later

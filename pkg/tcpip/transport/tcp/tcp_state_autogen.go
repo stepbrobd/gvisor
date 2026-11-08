@@ -485,6 +485,7 @@ func (e *Endpoint) StateFields() []string {
 		"maxSynRetries",
 		"windowClamp",
 		"sndQueueInfo",
+		"sndMemUsed",
 		"cc",
 		"ccSetBySockOpt",
 		"keepalive",
@@ -552,27 +553,28 @@ func (e *Endpoint) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveUint8(36, &e.maxSynRetries)
 	stateSinkObject.SaveUint32(37, &e.windowClamp)
 	stateSinkObject.Save(38, &e.sndQueueInfo)
-	stateSinkObject.Save(39, &e.cc)
-	stateSinkObject.SaveBool(40, &e.ccSetBySockOpt)
-	stateSinkObject.Save(41, &e.keepalive)
-	stateSinkObject.Save(42, &e.userTimeout)
-	stateSinkObject.Save(43, &e.deferAccept)
-	stateSinkObject.Save(44, &e.acceptQueue)
-	stateSinkObject.Save(45, &e.rcv)
-	stateSinkObject.Save(46, &e.snd)
-	stateSinkObject.Save(47, &e.connectingAddress)
-	stateSinkObject.SaveUint16(48, &e.amss)
-	stateSinkObject.SaveUint8(49, &e.sendTOS)
-	stateSinkObject.Save(50, &e.gso)
-	stateSinkObject.Save(51, &e.stats)
-	stateSinkObject.Save(52, &e.tcpLingerTimeout)
-	stateSinkObject.SaveBool(53, &e.closed)
-	stateSinkObject.SaveUint32(54, &e.txHash)
-	stateSinkObject.Save(55, &e.owner)
-	stateSinkObject.Save(56, &e.ops)
-	stateSinkObject.Save(57, &e.lastOutOfWindowAckTime)
-	stateSinkObject.Save(58, &e.pmtud)
-	stateSinkObject.SaveBool(59, &e.terminateAtRestore)
+	stateSinkObject.Save(39, &e.sndMemUsed)
+	stateSinkObject.Save(40, &e.cc)
+	stateSinkObject.SaveBool(41, &e.ccSetBySockOpt)
+	stateSinkObject.Save(42, &e.keepalive)
+	stateSinkObject.Save(43, &e.userTimeout)
+	stateSinkObject.Save(44, &e.deferAccept)
+	stateSinkObject.Save(45, &e.acceptQueue)
+	stateSinkObject.Save(46, &e.rcv)
+	stateSinkObject.Save(47, &e.snd)
+	stateSinkObject.Save(48, &e.connectingAddress)
+	stateSinkObject.SaveUint16(49, &e.amss)
+	stateSinkObject.SaveUint8(50, &e.sendTOS)
+	stateSinkObject.Save(51, &e.gso)
+	stateSinkObject.Save(52, &e.stats)
+	stateSinkObject.Save(53, &e.tcpLingerTimeout)
+	stateSinkObject.SaveBool(54, &e.closed)
+	stateSinkObject.SaveUint32(55, &e.txHash)
+	stateSinkObject.Save(56, &e.owner)
+	stateSinkObject.Save(57, &e.ops)
+	stateSinkObject.Save(58, &e.lastOutOfWindowAckTime)
+	stateSinkObject.Save(59, &e.pmtud)
+	stateSinkObject.SaveBool(60, &e.terminateAtRestore)
 	stateSinkObject.SaveValue(12, stateValue)
 }
 
@@ -616,27 +618,28 @@ func (e *Endpoint) StateLoad(ctx context.Context, stateSourceObject state.Source
 	stateSourceObject.LoadUint8(36, &e.maxSynRetries)
 	stateSourceObject.LoadUint32(37, &e.windowClamp)
 	stateSourceObject.Load(38, &e.sndQueueInfo)
-	stateSourceObject.Load(39, &e.cc)
-	stateSourceObject.LoadBool(40, &e.ccSetBySockOpt)
-	stateSourceObject.Load(41, &e.keepalive)
-	stateSourceObject.Load(42, &e.userTimeout)
-	stateSourceObject.Load(43, &e.deferAccept)
-	stateSourceObject.Load(44, &e.acceptQueue)
-	stateSourceObject.LoadWait(45, &e.rcv)
-	stateSourceObject.LoadWait(46, &e.snd)
-	stateSourceObject.Load(47, &e.connectingAddress)
-	stateSourceObject.LoadUint16(48, &e.amss)
-	stateSourceObject.LoadUint8(49, &e.sendTOS)
-	stateSourceObject.Load(50, &e.gso)
-	stateSourceObject.Load(51, &e.stats)
-	stateSourceObject.Load(52, &e.tcpLingerTimeout)
-	stateSourceObject.LoadBool(53, &e.closed)
-	stateSourceObject.LoadUint32(54, &e.txHash)
-	stateSourceObject.Load(55, &e.owner)
-	stateSourceObject.Load(56, &e.ops)
-	stateSourceObject.Load(57, &e.lastOutOfWindowAckTime)
-	stateSourceObject.Load(58, &e.pmtud)
-	stateSourceObject.LoadBool(59, &e.terminateAtRestore)
+	stateSourceObject.Load(39, &e.sndMemUsed)
+	stateSourceObject.Load(40, &e.cc)
+	stateSourceObject.LoadBool(41, &e.ccSetBySockOpt)
+	stateSourceObject.Load(42, &e.keepalive)
+	stateSourceObject.Load(43, &e.userTimeout)
+	stateSourceObject.Load(44, &e.deferAccept)
+	stateSourceObject.Load(45, &e.acceptQueue)
+	stateSourceObject.LoadWait(46, &e.rcv)
+	stateSourceObject.LoadWait(47, &e.snd)
+	stateSourceObject.Load(48, &e.connectingAddress)
+	stateSourceObject.LoadUint16(49, &e.amss)
+	stateSourceObject.LoadUint8(50, &e.sendTOS)
+	stateSourceObject.Load(51, &e.gso)
+	stateSourceObject.Load(52, &e.stats)
+	stateSourceObject.Load(53, &e.tcpLingerTimeout)
+	stateSourceObject.LoadBool(54, &e.closed)
+	stateSourceObject.LoadUint32(55, &e.txHash)
+	stateSourceObject.Load(56, &e.owner)
+	stateSourceObject.Load(57, &e.ops)
+	stateSourceObject.Load(58, &e.lastOutOfWindowAckTime)
+	stateSourceObject.Load(59, &e.pmtud)
+	stateSourceObject.LoadBool(60, &e.terminateAtRestore)
 	stateSourceObject.LoadValueTo(12, (*EndpointState)(nil), e)
 	stateSourceObject.AfterLoadTo(e)
 }
@@ -1680,6 +1683,7 @@ func (t *TCPSndBufState) StateFields() []string {
 	return []string{
 		"SndBufSize",
 		"SndBufUsed",
+		"SndMemUsed",
 		"SndClosed",
 		"PacketTooBigCount",
 		"SndMTU",
@@ -1694,10 +1698,11 @@ func (t *TCPSndBufState) StateSave(stateSinkObject state.Sink) {
 	t.beforeSave()
 	stateSinkObject.SaveInt(0, &t.SndBufSize)
 	stateSinkObject.SaveInt(1, &t.SndBufUsed)
-	stateSinkObject.SaveBool(2, &t.SndClosed)
-	stateSinkObject.SaveInt(3, &t.PacketTooBigCount)
-	stateSinkObject.SaveInt(4, &t.SndMTU)
-	stateSinkObject.Save(5, &t.AutoTuneSndBufDisabled)
+	stateSinkObject.SaveInt(2, &t.SndMemUsed)
+	stateSinkObject.SaveBool(3, &t.SndClosed)
+	stateSinkObject.SaveInt(4, &t.PacketTooBigCount)
+	stateSinkObject.SaveInt(5, &t.SndMTU)
+	stateSinkObject.Save(6, &t.AutoTuneSndBufDisabled)
 }
 
 func (t *TCPSndBufState) afterLoad(context.Context) {}
@@ -1706,10 +1711,11 @@ func (t *TCPSndBufState) afterLoad(context.Context) {}
 func (t *TCPSndBufState) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadInt(0, &t.SndBufSize)
 	stateSourceObject.LoadInt(1, &t.SndBufUsed)
-	stateSourceObject.LoadBool(2, &t.SndClosed)
-	stateSourceObject.LoadInt(3, &t.PacketTooBigCount)
-	stateSourceObject.LoadInt(4, &t.SndMTU)
-	stateSourceObject.Load(5, &t.AutoTuneSndBufDisabled)
+	stateSourceObject.LoadInt(2, &t.SndMemUsed)
+	stateSourceObject.LoadBool(3, &t.SndClosed)
+	stateSourceObject.LoadInt(4, &t.PacketTooBigCount)
+	stateSourceObject.LoadInt(5, &t.SndMTU)
+	stateSourceObject.Load(6, &t.AutoTuneSndBufDisabled)
 }
 
 func (t *TCPEndpointStateInner) StateTypeName() string {
