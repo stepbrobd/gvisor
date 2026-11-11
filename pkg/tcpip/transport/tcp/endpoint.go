@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"runtime"
 	"strings"
 	"time"
@@ -73,6 +74,9 @@ const (
 	// SegOverheadFactor is used to multiply the value provided by the
 	// user on a SetSockOpt for setting the socket send/receive buffer sizes.
 	SegOverheadFactor = 2
+
+	// minChunkSize is the size of the smallest chunk that pkg/buffer pools.
+	minChunkSize = 64
 )
 
 type connDirectionState uint32
@@ -516,6 +520,14 @@ type Endpoint struct {
 
 	// sndQueueInfo contains the implementation of the endpoint's send queue.
 	sndQueueInfo sndQueueInfo
+
+	// sndMemUsed tracks the total amount of memory in use by the segments of
+	// data held in the write list, counted as rcvMemUsed counts received
+	// segments (segMemSize): the segment, its packet buffer and the bytes of
+	// its data. The send buffer size limits it. This is distinct from
+	// SndBufUsed, which is the number of payload bytes held in the send
+	// buffer.
+	sndMemUsed atomicbitops.Int32
 
 	// cc stores the name of the Congestion Control algorithm to use for
 	// this endpoint.
@@ -983,7 +995,7 @@ func (e *Endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 		if (mask & waiter.WritableEvents) != 0 {
 			e.sndQueueInfo.sndQueueMu.Lock()
 			sndBufSize := e.getSendBufferSize()
-			if e.sndQueueInfo.SndClosed || e.sndQueueInfo.SndBufUsed < sndBufSize {
+			if e.sndQueueInfo.SndClosed || e.sendMemUsed() < sndBufSize {
 				result |= waiter.WritableEvents
 			}
 			if e.sndQueueInfo.SndClosed {
@@ -1607,7 +1619,7 @@ func (e *Endpoint) isEndpointWritableLocked() (int, tcpip.Error) {
 	}
 
 	sndBufSize := e.getSendBufferSize()
-	avail := sndBufSize - e.sndQueueInfo.SndBufUsed
+	avail := sndBufSize - e.sendMemUsed()
 	if avail <= 0 {
 		return 0, &tcpip.ErrWouldBlock{}
 	}
@@ -1644,12 +1656,26 @@ func (e *Endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions,
 	if l := p.Len(); l < avail {
 		avail = l
 	}
-	if avail == 0 {
-		return payload, nil
-	}
-	if _, err := payload.WriteFromReaderAndLimitedReader(p, int64(avail), limRdr); err != nil {
-		payload.Release()
-		return buffer.Buffer{}, &tcpip.ErrBadBuffer{}
+	// Read the data in pieces of a power of two, largest first, so that each
+	// piece fills its pooled chunk. Only the last piece, shorter than the
+	// smallest chunk, leaves room unused. sndMemUsed counts the bytes of the
+	// data, so the chunks then hold little more than what it counts.
+	for avail > 0 {
+		n := avail
+		if n > buffer.MaxChunkSize {
+			n = buffer.MaxChunkSize
+		} else if n >= minChunkSize {
+			n = 1 << (bits.Len(uint(n)) - 1)
+		}
+		read, err := payload.WriteFromReaderAndLimitedReader(p, int64(n), limRdr)
+		if err != nil {
+			payload.Release()
+			return buffer.Buffer{}, &tcpip.ErrBadBuffer{}
+		}
+		if read < int64(n) {
+			break
+		}
+		avail -= n
 	}
 	return payload, nil
 }
@@ -1699,6 +1725,7 @@ func (e *Endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
 	// Add data to the send queue.
 	size := int(buf.Size())
 	s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), buf, e.ops.GetMark())
+	s.setOwner(e, sendQ)
 	e.sndQueueInfo.SndBufUsed += size
 	e.snd.writeList.PushBack(s)
 
@@ -1931,9 +1958,8 @@ func (e *Endpoint) WakeupWriters() {
 	defer e.UnlockUser()
 
 	sendBufferSize := e.getSendBufferSize()
-	e.sndQueueInfo.sndQueueMu.Lock()
-	notify := (sendBufferSize - e.sndQueueInfo.SndBufUsed) >= e.sndQueueInfo.SndBufUsed>>1
-	e.sndQueueInfo.sndQueueMu.Unlock()
+	used := e.sendMemUsed()
+	notify := (sendBufferSize - used) >= used>>1
 
 	if notify {
 		e.waiterQueue.Notify(waiter.WritableEvents)
@@ -3139,13 +3165,14 @@ func (e *Endpoint) HandleError(transErr stack.TransportError, pkt *stack.PacketB
 }
 
 // updateSndBufferUsage is called by when room opens up in the send buffer. The
-// number of newly available bytes is v.
+// number of newly available bytes is v, and the send queue held memUsedBefore
+// bytes of memory (sendMemUsed) before it.
 //
 // +checklocks:e.mu
-func (e *Endpoint) updateSndBufferUsage(v int) {
+func (e *Endpoint) updateSndBufferUsage(v, memUsedBefore int) {
 	sendBufferSize := e.getSendBufferSize()
 	e.sndQueueInfo.sndQueueMu.Lock()
-	notify := e.sndQueueInfo.SndBufUsed >= sendBufferSize>>1
+	notify := memUsedBefore >= sendBufferSize>>1
 	e.sndQueueInfo.SndBufUsed -= v
 
 	// Get the new send buffer size with auto tuning, but do not set it
@@ -3155,7 +3182,7 @@ func (e *Endpoint) updateSndBufferUsage(v int) {
 	// We only notify when there is half the sendBufferSize available after
 	// a full buffer event occurs. This ensures that we don't wake up
 	// writers to queue just 1-2 segments and go back to sleep.
-	notify = notify && e.sndQueueInfo.SndBufUsed < int(newSndBufSz)>>1
+	notify = notify && e.sendMemUsed() < int(newSndBufSz)>>1
 	e.sndQueueInfo.sndQueueMu.Unlock()
 
 	if notify {
@@ -3223,6 +3250,17 @@ func (e *Endpoint) receiveMemUsed() int64 {
 // updateReceiveMemUsed adds the provided delta to e.rcvMemUsed.
 func (e *Endpoint) updateReceiveMemUsed(delta int) {
 	e.rcvMemUsed.Add(int64(delta))
+}
+
+// sendMemUsed returns the total memory in use by the segments of data held in
+// the write list.
+func (e *Endpoint) sendMemUsed() int {
+	return int(e.sndMemUsed.Load())
+}
+
+// updateSendMemUsed adds the provided delta to e.sndMemUsed.
+func (e *Endpoint) updateSendMemUsed(delta int) {
+	e.sndMemUsed.Add(int32(delta))
 }
 
 // maxReceiveBufferSize returns the stack wide maximum receive buffer size for
@@ -3334,6 +3372,7 @@ func (e *Endpoint) completeStateLocked(s *TCPEndpointState) {
 	e.sndQueueInfo.sndQueueMu.Lock()
 	e.sndQueueInfo.CloneState(&s.SndBufState)
 	s.SndBufState.SndBufSize = sndBufSize
+	s.SndBufState.SndMemUsed = e.sendMemUsed()
 	e.sndQueueInfo.sndQueueMu.Unlock()
 
 	// Copy the receive buffer atomically.
