@@ -12,25 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build arm64 && pagesize_64k
-
-package hostarch
-
-import "golang.org/x/sys/unix"
-
-const (
-	// PageShift is the binary log of the system page size.
-	// 64K pages: 2^16 = 65536
-	PageShift = 16
-
-	// HugePageShift is the binary log of the system huge page size.
-	// For 64K pages: PageShift + (PageShift - 3) = 16 + 13 = 29
-	// This gives 512MB huge pages.
-	HugePageShift = 29
-)
-
-func init() {
-	if size := unix.Getpagesize(); size != PageSize {
-		println("WARNING: host page size mismatch - running on non-64K host")
-	}
-}
+// Package cgoextras provides cgo-only runtime workarounds and initialization
+// for runsc and sentry binaries.
+//
+// In pure-Go binaries (CGO_ENABLED=0), cgo code in this package is not built.
+// When cgo is enabled (e.g., -race, network plugins), this package is compiled
+// with cgo and runs early process initialization such as disabling host ARM64
+// Pointer Authentication (PAC) keys via an ELF .init_array constructor before
+// libpthread or the Go runtime spawns threads.
+package cgoextras

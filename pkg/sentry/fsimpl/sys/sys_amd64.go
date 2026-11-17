@@ -12,25 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build arm64 && !pagesize_64k
+//go:build amd64
+// +build amd64
 
-package hostarch
+package sys
 
-import "golang.org/x/sys/unix"
-
-const (
-	// PageShift is the binary log of the system page size.
-	// 4K pages: 2^12 = 4096
-	PageShift = 12
-
-	// HugePageShift is the binary log of the system huge page size.
-	// For 4K pages: PageShift + (PageShift - 3) = 12 + 9 = 21
-	// This gives 2MB huge pages.
-	HugePageShift = 21
-)
-
-func init() {
-	if size := unix.Getpagesize(); size != PageSize {
-		println("WARNING: host page size mismatch - running on non-4K host")
-	}
-}
+// topologyHasDie is true if cpuN/topology has die_id and die_cpus{,_list}.
+// Linux defines TOPOLOGY_DIE_SYSFS when the architecture defines
+// topology_die_id() and topology_die_cpumask() (include/linux/topology.h),
+// which x86 does (arch/x86/include/asm/topology.h).
+const topologyHasDie = true

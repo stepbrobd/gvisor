@@ -150,6 +150,7 @@ func (p *bridgePort) StateFields() []string {
 	return []string{
 		"bridge",
 		"nic",
+		"addr",
 	}
 }
 
@@ -160,6 +161,7 @@ func (p *bridgePort) StateSave(stateSinkObject state.Sink) {
 	p.beforeSave()
 	stateSinkObject.Save(0, &p.bridge)
 	stateSinkObject.Save(1, &p.nic)
+	stateSinkObject.Save(2, &p.addr)
 }
 
 func (p *bridgePort) afterLoad(context.Context) {}
@@ -168,6 +170,7 @@ func (p *bridgePort) afterLoad(context.Context) {}
 func (p *bridgePort) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &p.bridge)
 	stateSourceObject.Load(1, &p.nic)
+	stateSourceObject.Load(2, &p.addr)
 }
 
 func (b *BridgeEndpoint) StateTypeName() string {
@@ -177,6 +180,7 @@ func (b *BridgeEndpoint) StateTypeName() string {
 func (b *BridgeEndpoint) StateFields() []string {
 	return []string{
 		"ports",
+		"localAddrs",
 		"dispatcher",
 		"addr",
 		"attached",
@@ -192,12 +196,13 @@ func (b *BridgeEndpoint) beforeSave() {}
 func (b *BridgeEndpoint) StateSave(stateSinkObject state.Sink) {
 	b.beforeSave()
 	stateSinkObject.Save(0, &b.ports)
-	stateSinkObject.Save(1, &b.dispatcher)
-	stateSinkObject.Save(2, &b.addr)
-	stateSinkObject.SaveBool(3, &b.attached)
-	stateSinkObject.SaveUint32(4, &b.mtu)
-	stateSinkObject.Save(5, &b.fdbTable)
-	stateSinkObject.Save(6, &b.maxHeaderLength)
+	stateSinkObject.Save(1, &b.localAddrs)
+	stateSinkObject.Save(2, &b.dispatcher)
+	stateSinkObject.Save(3, &b.addr)
+	stateSinkObject.SaveBool(4, &b.attached)
+	stateSinkObject.SaveUint32(5, &b.mtu)
+	stateSinkObject.Save(6, &b.fdbTable)
+	stateSinkObject.Save(7, &b.maxHeaderLength)
 }
 
 func (b *BridgeEndpoint) afterLoad(context.Context) {}
@@ -205,12 +210,13 @@ func (b *BridgeEndpoint) afterLoad(context.Context) {}
 // +checklocksignore
 func (b *BridgeEndpoint) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &b.ports)
-	stateSourceObject.Load(1, &b.dispatcher)
-	stateSourceObject.Load(2, &b.addr)
-	stateSourceObject.LoadBool(3, &b.attached)
-	stateSourceObject.LoadUint32(4, &b.mtu)
-	stateSourceObject.Load(5, &b.fdbTable)
-	stateSourceObject.Load(6, &b.maxHeaderLength)
+	stateSourceObject.Load(1, &b.localAddrs)
+	stateSourceObject.Load(2, &b.dispatcher)
+	stateSourceObject.Load(3, &b.addr)
+	stateSourceObject.LoadBool(4, &b.attached)
+	stateSourceObject.LoadUint32(5, &b.mtu)
+	stateSourceObject.Load(6, &b.fdbTable)
+	stateSourceObject.Load(7, &b.maxHeaderLength)
 }
 
 func (t *tuple) StateTypeName() string {
@@ -1296,6 +1302,7 @@ func (n *nic) StateFields() []string {
 		"deliverLinkPackets",
 		"Primary",
 		"experimentIPOptionEnabled",
+		"allowExternalIPv4LoopbackTraffic",
 	}
 }
 
@@ -1328,6 +1335,7 @@ func (n *nic) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(21, &n.deliverLinkPackets)
 	stateSinkObject.Save(22, &n.Primary)
 	stateSinkObject.SaveBool(23, &n.experimentIPOptionEnabled)
+	stateSinkObject.SaveBool(24, &n.allowExternalIPv4LoopbackTraffic)
 }
 
 func (n *nic) afterLoad(context.Context) {}
@@ -1358,6 +1366,7 @@ func (n *nic) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadBool(21, &n.deliverLinkPackets)
 	stateSourceObject.Load(22, &n.Primary)
 	stateSourceObject.LoadBool(23, &n.experimentIPOptionEnabled)
+	stateSourceObject.LoadBool(24, &n.allowExternalIPv4LoopbackTraffic)
 }
 
 func (p *packetEndpointList) StateTypeName() string {

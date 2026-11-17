@@ -12,18 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build arm64 && !pagesize_64k
+//go:build arm64
+// +build arm64
 
-package ring0
+package sys
 
-// Page table layout constants for 4K page size.
-const (
-	_PGD_PGT_BASE = 0x1000
-	_PGD_PGT_SIZE = 0x1000
-	_PUD_PGT_BASE = 0x2000
-	_PUD_PGT_SIZE = 0x1000
-	_PMD_PGT_BASE = 0x3000
-	_PMD_PGT_SIZE = 0x4000
-	_PTE_PGT_BASE = 0x7000
-	_PTE_PGT_SIZE = 0x1000
-)
+// topologyHasDie is true if cpuN/topology has die_id and die_cpus{,_list}.
+// arm64 does not define topology_die_id() or topology_die_cpumask()
+// (include/linux/arch_topology.h), so Linux does not create them.
+const topologyHasDie = false

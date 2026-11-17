@@ -63,10 +63,12 @@ type InternalData struct {
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
+	// EnableNUMATopology exposes one virtual NUMA node containing every
+	// application CPU.
+	EnableNUMATopology bool
 	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
 	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
-	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
-	// /sys/devices/system/node) is constructed.
+	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices) is constructed.
 	RDMASysfs *rdma.Snapshot
 	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
 	// unit testing.
@@ -81,6 +83,7 @@ type filesystem struct {
 
 	devMinor            uint32
 	enableTPUProxyPaths bool
+	enableNUMATopology  bool
 	testSysfsPathPrefix string
 	// productName is the value of devices/virtual/dmi/id/product_name. If
 	// empty, the DMI directories are not created.
@@ -213,9 +216,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			for name, sub := range rdmaDirs.busPCIDrivers {
 				pciDrivers[name] = sub
 			}
-			if rdmaDirs.node != nil {
-				systemSub["node"] = rdmaDirs.node
-			}
+		}
+		fs.enableNUMATopology = idata.EnableNUMATopology
+		if fs.enableNUMATopology {
+			systemSub["node"] = fs.buildNUMATopology(ctx, creds, k.ApplicationCores())
 		}
 	}
 	if len(pciDevices) > 0 || len(pciDrivers) > 0 {
@@ -319,6 +323,37 @@ func cpuMask(first, end, cores uint) string {
 		sep = ","
 	}
 	return b.String()
+}
+
+// cpuListString formats CPUs [first, end) in the kernel's "%*pbl" cpulist
+// format (lib/vsprintf.c:bitmap_list_string()), as used by
+// drivers/base/cpu.c:show_cpus_attr() and the drivers/base/topology.c *_list
+// files.
+//
+// Preconditions: first < end.
+func cpuListString(first, end uint) string {
+	if end-first == 1 {
+		return fmt.Sprintf("%d\n", first)
+	}
+	return fmt.Sprintf("%d-%d\n", first, end-1)
+}
+
+// buildNUMATopology synthesizes the /sys/devices/system/node subtree. gVisor's
+// memory model has a single NUMA node containing every application CPU.
+func (fs *filesystem) buildNUMATopology(ctx context.Context, creds *auth.Credentials, cores uint) kernfs.Inode {
+	entries := map[string]kernfs.Inode{}
+	// The aggregate files (online, possible, has_cpu, ...) are all
+	// node-range lists; the single node 0 covers them all.
+	for _, name := range []string{"online", "possible", "has_cpu", "has_memory", "has_normal_memory"} {
+		entries[name] = fs.newStaticFile(ctx, creds, defaultSysMode, "0\n")
+	}
+	entries["node0"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"cpumap":  fs.newStaticFile(ctx, creds, defaultSysMode, fullCPUMask(cores)+"\n"),
+		"cpulist": fs.newStaticFile(ctx, creds, defaultSysMode, cpuListString(0, cores)),
+		// The only node's distance to itself (LOCAL_DISTANCE).
+		"distance": fs.newStaticFile(ctx, creds, defaultSysMode, "10\n"),
+	})
+	return fs.newDir(ctx, creds, defaultSysDirMode, entries)
 }
 
 func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) map[string]kernfs.Inode {
@@ -545,16 +580,34 @@ func (d *lazyDir) children(ctx context.Context) map[string]kernfs.Inode {
 		return children
 	}
 	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
-	// socket and each CPU is a distinct core.
+	// socket and die and each CPU is a distinct core with its own cluster.
+	cpu := uint(d.cpu)
 	fullMask := fullCPUMask(d.cores) + "\n"
-	oneMask := oneCPUMask(uint(d.cpu), d.cores) + "\n"
+	fullList := cpuListString(0, d.cores)
+	oneMask := oneCPUMask(cpu, d.cores) + "\n"
+	oneList := fmt.Sprintf("%d\n", cpu)
+	topology := map[string]kernfs.Inode{
+		"cluster_cpus":         d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
+		"cluster_cpus_list":    d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneList),
+		"cluster_id":           d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fmt.Sprintf("%d\n", cpu)),
+		"core_cpus":            d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
+		"core_cpus_list":       d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneList),
+		"core_id":              d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fmt.Sprintf("%d\n", cpu)),
+		"core_siblings":        d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask),
+		"core_siblings_list":   d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullList),
+		"package_cpus":         d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask),
+		"package_cpus_list":    d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullList),
+		"physical_package_id":  d.fs.newStaticFile(ctx, d.creds, defaultSysMode, "0\n"),
+		"thread_siblings":      d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
+		"thread_siblings_list": d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneList),
+	}
+	if topologyHasDie {
+		topology["die_cpus"] = d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask)
+		topology["die_cpus_list"] = d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullList)
+		topology["die_id"] = d.fs.newStaticFile(ctx, d.creds, defaultSysMode, "0\n")
+	}
 	return map[string]kernfs.Inode{
-		"topology": d.fs.newDir(ctx, d.creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"core_cpus":       d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
-			"core_siblings":   d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask),
-			"package_cpus":    d.fs.newStaticFile(ctx, d.creds, defaultSysMode, fullMask),
-			"thread_siblings": d.fs.newStaticFile(ctx, d.creds, defaultSysMode, oneMask),
-		}),
+		"topology": d.fs.newDir(ctx, d.creds, defaultSysDirMode, topology),
 	}
 }
 
@@ -640,7 +693,7 @@ type cpuFile struct {
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (c *cpuFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	fmt.Fprintf(buf, "0-%d\n", c.maxCores-1)
+	buf.WriteString(cpuListString(0, c.maxCores))
 	return nil
 }
 

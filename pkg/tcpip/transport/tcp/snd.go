@@ -571,13 +571,6 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 		return nil
 	}
 
-	// Initialize the variables used to detect spurious recovery after
-	// entering RTO.
-	//
-	// See: https://www.rfc-editor.org/rfc/rfc3522.html#section-3.2 Step 1.
-	s.spuriousRecovery = false
-	s.retransmitTS = 0
-
 	// TODO(b/147297758): Band-aid fix, retransmitTimer can fire in some edge cases
 	// when writeList is empty. Remove this once we have a proper fix for this
 	// issue.
@@ -655,9 +648,7 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 		s.leaveRecovery()
 	}
 
-	// Record retransmitTS if the sender is not in recovery as per:
-	// https://datatracker.ietf.org/doc/html/rfc3522#section-3.2 Step 2
-	s.recordRetransmitTS()
+	s.startSpuriousRecoveryDetection()
 
 	s.state = tcpip.RTORecovery
 	s.cc.HandleRTOExpired()
@@ -1183,13 +1174,6 @@ func (s *sender) sendData() {
 
 // +checklocks:s.ep.mu
 func (s *sender) enterRecovery() {
-	// Initialize the variables used to detect spurious recovery after
-	// entering recovery.
-	//
-	// See: https://www.rfc-editor.org/rfc/rfc3522.html#section-3.2 Step 1.
-	s.spuriousRecovery = false
-	s.retransmitTS = 0
-
 	s.FastRecovery.Active = true
 	// Save state to reflect we're now in fast recovery.
 	//
@@ -1205,9 +1189,7 @@ func (s *sender) enterRecovery() {
 	s.FastRecovery.HighRxt = s.SndUna
 	s.FastRecovery.RescueRxt = s.SndUna
 
-	// Record retransmitTS if the sender is not in recovery as per:
-	// https://datatracker.ietf.org/doc/html/rfc3522#section-3.2 Step 2
-	s.recordRetransmitTS()
+	s.startSpuriousRecoveryDetection()
 
 	if s.ep.SACKPermitted {
 		s.state = tcpip.SACKRecovery
@@ -1492,7 +1474,7 @@ func checkDSACK(rcvdSeg *segment) bool {
 }
 
 // +checklocks:s.ep.mu
-func (s *sender) recordRetransmitTS() {
+func (s *sender) startSpuriousRecoveryDetection() {
 	// See: https://datatracker.ietf.org/doc/html/rfc3522#section-3.2
 	//
 	// The Eifel detection algorithm is used, only upon initiation of loss
@@ -1505,6 +1487,9 @@ func (s *sender) recordRetransmitTS() {
 	if s.inRecovery() {
 		return
 	}
+
+	// Step 1: no spurious recovery has been detected for this episode.
+	s.spuriousRecovery = false
 
 	// See: https://datatracker.ietf.org/doc/html/rfc3522#section-3.2 Step 2
 	//
@@ -1529,7 +1514,7 @@ func (s *sender) detectSpuriousRecovery(hasDSACK bool, tsEchoReply uint32) {
 	// If the value of the Timestamp Echo Reply field of the acceptable ACK's
 	// Timestamps option is smaller than the value of RetransmitTS, then
 	// proceed to next step, else return.
-	if tsEchoReply >= s.retransmitTS {
+	if !seqnum.Value(tsEchoReply).LessThan(seqnum.Value(s.retransmitTS)) {
 		return
 	}
 
