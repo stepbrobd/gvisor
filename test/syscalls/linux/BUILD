@@ -412,6 +412,27 @@ cc_binary(
 )
 
 cc_binary(
+    name = "bridge_test",
+    testonly = 1,
+    srcs = ["bridge.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":socket_netlink_route_util",
+        ":socket_netlink_util",
+        "//test/util:capability_util",
+        "//test/util:file_descriptor",
+        "//test/util:logging",
+        "//test/util:posix_error",
+        "//test/util:save_util",
+        "//test/util:socket_util",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_binary(
     name = "brk_test",
     testonly = 1,
     srcs = ["brk.cc"],
@@ -1136,6 +1157,23 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+    ],
+)
+
+cc_binary(
+    name = "fpstate_stop_test",
+    testonly = 1,
+    srcs = select_arch(
+        amd64 = ["fpstate_stop_amd64.cc"],
+        default = [],
+    ),
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -3107,6 +3145,7 @@ cc_binary(
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
+        "//test/util:epoll_util",
         "//test/util:file_descriptor",
         "//test/util:logging",
         "//test/util:multiprocess_util",
@@ -3216,6 +3255,23 @@ cc_binary(
 )
 
 cc_binary(
+    name = "socket_data_transfer_stress_test",
+    testonly = 1,
+    srcs = ["socket_data_transfer_stress.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":ip_socket_test_util",
+        "//test/util:posix_error",
+        "//test/util:socket_util",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_binary(
     name = "socket_stress_test",
     testonly = 1,
     srcs = [
@@ -3225,13 +3281,10 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         ":ip_socket_test_util",
-        "//test/util:file_descriptor",
         "//test/util:posix_error",
         "//test/util:socket_util",
         "//test/util:test_main",
         "//test/util:test_util",
-        "//test/util:thread_util",
-        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
     ],
 )
@@ -3401,7 +3454,6 @@ cc_library(
         "//test/util:socket_util",
         "//test/util:test_util",
         "@com_google_absl//absl/cleanup",
-        "@com_google_absl//absl/memory",
     ],
     alwayslink = 1,
 )
@@ -3418,10 +3470,8 @@ cc_library(
     deps = select_gtest() + [
         ":ip_socket_test_util",
         "//test/util:posix_error",
-        "//test/util:save_util",
         "//test/util:socket_util",
         "//test/util:test_util",
-        "@com_google_absl//absl/memory",
     ],
     alwayslink = 1,
 )
@@ -3495,7 +3545,6 @@ cc_library(
     deps = select_gtest() + [
         ":ip_socket_test_util",
         ":socket_ip_udp_unbound_external_networking",
-        "//test/util:capability_util",
         "//test/util:posix_error",
         "//test/util:socket_util",
         "//test/util:test_util",
@@ -4770,6 +4819,22 @@ cc_binary(
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "sysfs_cpu_topology_test",
+    testonly = 1,
+    srcs = ["sysfs_cpu_topology.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:fs_util",
+        "//test/util:posix_error",
+        "//test/util:save_util",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "@com_google_absl//absl/strings",
     ],
 )
 

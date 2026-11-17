@@ -952,6 +952,12 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
 // this endpoint.
 func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
+	// As in ip_rcv_core, frames for another host's link address are dropped
+	// before they are counted.
+	if pkt.PktType == tcpip.PacketOtherHost {
+		return
+	}
+
 	stats := e.stats.ip
 
 	stats.PacketsReceived.Increment()
@@ -970,7 +976,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	defer hView.Release()
 
 	if !e.nic.IsLoopback() {
-		if !e.protocol.allowExternalLoopbackTraffic.Load() {
+		if !e.protocol.allowExternalLoopbackTraffic.Load() && !e.nic.AllowExternalIPv4LoopbackTraffic() {
 			if header.IsV4LoopbackAddress(h.SourceAddress()) {
 				martianPacketLogger.Infof("Martian packet dropped with loopback source address. If your traffic is unexpectedly dropped, you may want to allow martian packets.")
 				stats.InvalidSourceAddressesReceived.Increment()

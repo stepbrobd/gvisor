@@ -496,6 +496,7 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
 	@$(call install_runtime_noreload,$(RUNTIME)-net-uds,--network-proxy-path=$(NET_PROXY_SOCKET)) # Used by TestExternalUDSProxy*.
 	@$(call install_runtime_noreload,$(RUNTIME)-netgofer-proxy,--netgofer=proxy) # Used by TestNetgoferProxy*.
+	@$(call install_runtime_noreload,$(RUNTIME)-netgofer-proxy-loopback,--netgofer=proxy-loopback) # Used by TestNetgoferProxy*.
 	@$(call install_runtime,$(RUNTIME)-cgroupv2,--in-sandbox-cgroup=v2) # Used by TestSystemd* and TestPIDFDSelftests.
 	@$(call test_runtime_cached,$(RUNTIME),-- $(INTEGRATION_TARGETS) //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test //test/e2e:uds_proxy_test)
 .PHONY: docker-tests
@@ -846,6 +847,26 @@ seccomp-sentry-filters:  # Dumps seccomp-bpf program for the Sentry binary.
 .PHONY: seccomp-sentry-filters
 
 ##
+## Compatibility testing.
+##
+FSCHECKPOINT_CORPUS_DIR ?= $(CURDIR)/.fscheckpoint_corpus/compatibility_testing
+
+fscheckpoint-corpus-generate: $(RUNTIME_BIN) ## Generate a fscheckpoint compatibility corpus snapshot.
+	@set -e; \
+	CORPUS_OUT="$${FSCHECKPOINT_GENERATE_CORPUS_DIR:-$(CURDIR)/compatibility_testing}"; \
+	HEAD_HASH="$$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"; \
+	TIMESTAMP="$$(date +%Y%m%d-%H%M%S)"; \
+	OUT_DIR="$${CORPUS_OUT}/$${TIMESTAMP}_$${HEAD_HASH}"; \
+	mkdir -p "$${OUT_DIR}"; \
+	$(call sudo,//runsc/container:fscheckpoint_compat_test,-test.v -test.run=TestFSCheckpointCorpusGenerate -fscheckpoint-generate-dir="$${OUT_DIR}" $(if $(FSCHECKPOINT_RUNSC_BIN),-fscheckpoint-runsc-bin="$(FSCHECKPOINT_RUNSC_BIN)")); \
+	echo "Generated fscheckpoint corpus snapshot at $${OUT_DIR}"
+.PHONY: fscheckpoint-corpus-generate
+
+fscheckpoint-compat-tests: ## Run fscheckpoint backward compatibility tests against corpus.
+	@$(call test,--sandbox_add_mount_pair=$(FSCHECKPOINT_CORPUS_DIR) --test_env=FSCHECKPOINT_CORPUS_DIR=$(FSCHECKPOINT_CORPUS_DIR) //runsc/container:fscheckpoint_compat_test -- -test.v -test.run=TestFSCheckpointCompatibility)
+.PHONY: fscheckpoint-compat-tests
+
+##
 ## Website & documentation helpers.
 ##
 ##   The website is built from repository documentation and wrappers, using
@@ -1038,14 +1059,16 @@ tag: ## Stages a release tag; the release pipeline publishes it once the artifac
 ##   These run source-level formatting and lint checks.
 ##   Deep Go analysis is owned by gVisor nogo.
 ##
+
+lint_sh = $(call wrapper,tools/lint.sh --bazel="$(BAZEL)" --bazel-options="$(BASE_OPTIONS) $(BAZEL_OPTIONS)" $(1))
 lint: ensure-bazel-server ## Runs the source linters.
-	@$(call wrapper,tools/lint.sh)
+	@$(call lint_sh)
 .PHONY: lint
 
 lint-fix: ensure-bazel-server ## Reformats sources in place.
-	@$(call wrapper,tools/lint.sh --fix)
+	@$(call lint_sh,--fix)
 .PHONY: lint-fix
 
-lint-cc: ensure-bazel-server ## Runs clang-tidy over the C++ sources; needs bazel for compile_commands.json.
-	@$(call wrapper,tools/lint.sh clang-tidy)
+lint-cc: ensure-bazel-server ## Runs clang-tidy over the C++ sources.
+	@$(call lint_sh,clang-tidy)
 .PHONY: lint-cc

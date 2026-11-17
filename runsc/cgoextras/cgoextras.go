@@ -12,18 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build arm64 && !pagesize_64k
-
-package ring0
-
-// Page table layout constants for 4K page size.
-const (
-	_PGD_PGT_BASE = 0x1000
-	_PGD_PGT_SIZE = 0x1000
-	_PUD_PGT_BASE = 0x2000
-	_PUD_PGT_SIZE = 0x1000
-	_PMD_PGT_BASE = 0x3000
-	_PMD_PGT_SIZE = 0x4000
-	_PTE_PGT_BASE = 0x7000
-	_PTE_PGT_SIZE = 0x1000
-)
+// Package cgoextras provides cgo-only runtime workarounds and initialization
+// for runsc and sentry binaries.
+//
+// In pure-Go binaries (CGO_ENABLED=0), cgo code in this package is not built.
+// When cgo is enabled (e.g., -race, network plugins), this package is compiled
+// with cgo and runs early process initialization such as disabling host ARM64
+// Pointer Authentication (PAC) keys via an ELF .init_array constructor before
+// libpthread or the Go runtime spawns threads.
+package cgoextras

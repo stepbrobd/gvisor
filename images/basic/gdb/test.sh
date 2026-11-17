@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/bin/sh
 
-# Copyright 2022 The gVisor Authors.
+# Copyright 2026 The gVisor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,24 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -xuo pipefail # Allow failure; we check below.
-
-declare output
-declare rc
-output="$("${1}")" # Execute the provided parameter.
-rc=$?          # Record the result.
-readonly output
-readonly rc
-
-# Sanity check.
-if [[ "${rc}" -eq "0" ]]; then
-  echo "Expected failure; got success."
-  exit 1
-fi
-if [[ "${output}" != *'fmt.Fprintf format %d has arg "hello world!" of wrong type string'* ]]; then
-  echo "Expected format error; not found."
-  exit 1
-fi
-
-# All done.
-echo "PASS"
+set -eu
+cd /test
+mkfifo /tmp/ready
+./tracee > /tmp/ready &
+tracee_pid=$!
+trap 'kill "$tracee_pid" 2>/dev/null || true' EXIT
+read -r ready < /tmp/ready
+rm /tmp/ready
+test "$ready" = ready
+gdb --nx --batch ./tracee -ex "attach $tracee_pid" -x test.gdb
+wait "$tracee_pid"
+trap - EXIT
